@@ -1,0 +1,129 @@
+// ============================================================
+// INTERLOGIX / ITI 319.5 MHZ DIRECT BINARY BIT-STREAM DUMPER
+// ============================================================
+#include <Arduino.h>
+#include <SPI.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+
+#define CC1101_SCK   1
+#define CC1101_MISO  2
+#define CC1101_MOSI  39
+#define CC1101_CS    5
+#define CC1101_GDO0  6
+
+#define BUFFER_SIZE      500
+#define BURST_GAP_US     45000 
+#define MIN_PULSE_US     60    
+#define CLOCK_UNIT_US    125   // The base Interlogix timing unit
+
+volatile uint32_t pulseDurations[BUFFER_SIZE];
+volatile uint8_t pulseLevels[BUFFER_SIZE];
+volatile uint16_t pulseCount = 0;
+volatile uint32_t lastEdgeMicros = 0;
+volatile bool burstActive = false;
+volatile bool trackingReady = false;
+
+void IRAM_ATTR gdo0ISR() {
+    uint32_t now = micros();
+    bool currentLevel = digitalRead(CC1101_GDO0);
+    uint32_t duration = now - lastEdgeMicros;
+
+    if (burstActive && duration < MIN_PULSE_US) return; 
+
+    lastEdgeMicros = now;
+
+    if (!burstActive) {
+        burstActive = true;
+        pulseCount = 0;
+        return;
+    }
+
+    if (pulseCount < BUFFER_SIZE && !trackingReady) {
+        pulseDurations[pulseCount] = duration;
+        pulseLevels[pulseCount] = currentLevel ? 0 : 1; 
+        pulseCount++;
+    }
+}
+
+void initCC1101() {
+    ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+    ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
+    ELECHOUSE_cc1101.Init();
+    ELECHOUSE_cc1101.setMHZ(319.50);
+    ELECHOUSE_cc1101.setModulation(2); 
+    ELECHOUSE_cc1101.setCCMode(0);
+    ELECHOUSE_cc1101.setPktFormat(3);  
+    ELECHOUSE_cc1101.setRxBW(203.00);   
+    ELECHOUSE_cc1101.setDRate(16.38);
+    ELECHOUSE_cc1101.setSyncMode(0);
+    ELECHOUSE_cc1101.setManchester(0);
+    ELECHOUSE_cc1101.setCrc(0);
+    ELECHOUSE_cc1101.SetRx();
+}
+
+void setup() {
+    delay(4000);
+    Serial.begin(115200);
+    delay(1000);
+    
+    pinMode(CC1101_CS, OUTPUT);
+    digitalWrite(CC1101_CS, HIGH);
+    pinMode(CC1101_GDO0, INPUT);
+
+    initCC1101();
+    
+    lastEdgeMicros = micros();
+    attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), gdo0ISR, CHANGE);
+    Serial.println("=== 319.5 MHZ LIVE BIT-STREAM MONITOR ONLINE ===");
+}
+
+void loop() {
+    uint32_t now = micros();
+
+    if (burstActive && ((uint32_t)(now - lastEdgeMicros) > BURST_GAP_US)) {
+        noInterrupts();
+        trackingReady = true;
+        uint16_t finalCount = pulseCount;
+        interrupts();
+
+        if (finalCount > 40) {
+            Serial.printf("\n--- BITSTREAM DECODED (%d Transitions) ---\n", finalCount);
+            Serial.print("Bits: ");
+            
+            bool insideDataStream = false;
+            
+            for (uint16_t i = 0; i < finalCount; i++) {
+                // Calculate how many clock units this pulse spans
+                uint32_t units = (pulseDurations[i] + (CLOCK_UNIT_US / 2)) / CLOCK_UNIT_US;
+                if (units < 1) units = 1;
+
+                // Look for an entry/sync marker (e.g. an unusually wide high or anchor pulse)
+                if (pulseLevels[i] == 1 && units >= 3) {
+                    insideDataStream = true;
+                    Serial.print("[SYNC] ");
+                    continue;
+                }
+
+                // If inside data window, map out the short vs double wide pulses
+                if (insideDataStream) {
+                    if (units == 1) {
+                        Serial.print("0");
+                    } else if (units == 2) {
+                        Serial.print("1");
+                    } else if (units >= 3) {
+                        // Mark unique framing/marker blocks in the unaligned code stream
+                        Serial.printf(" [M:%d] ", units);
+                    }
+                }
+            }
+            Serial.println("\n----------------------------------------------");
+        }
+
+        noInterrupts();
+        pulseCount = 0;
+        burstActive = false;
+        trackingReady = false;
+        interrupts();
+    }
+    yield();
+}
