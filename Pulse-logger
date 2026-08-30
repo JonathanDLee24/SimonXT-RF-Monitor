@@ -1,0 +1,119 @@
+// ============================================================
+// VERBOSE REGISTRY TRACE ENGINE (HARDWARE FREEZE DETECTOR)
+// ============================================================
+#include <Arduino.h>
+#include <SPI.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+
+#define CC1101_SCK   1
+#define CC1101_MISO  2
+#define CC1101_MOSI  39
+#define CC1101_CS    5
+#define CC1101_GDO0  6
+
+#define BUFFER_SIZE      500
+#define BURST_GAP_US     45000 
+#define MIN_PULSE_US     60    
+
+volatile uint32_t pulseDurations[BUFFER_SIZE];
+volatile uint8_t pulseLevels[BUFFER_SIZE];
+volatile uint16_t pulseCount = 0;
+volatile uint32_t lastEdgeMicros = 0;
+volatile bool burstActive = false;
+volatile bool trackingReady = false;
+
+void IRAM_ATTR gdo0ISR() {
+    uint32_t now = micros();
+    bool currentLevel = digitalRead(CC1101_GDO0);
+    uint32_t duration = now - lastEdgeMicros;
+    if (burstActive && duration < MIN_PULSE_US) return; 
+    lastEdgeMicros = now;
+    if (!burstActive) {
+        burstActive = true;
+        pulseCount = 0;
+        return;
+    }
+    if (pulseCount < BUFFER_SIZE && !trackingReady) {
+        pulseDurations[pulseCount] = duration;
+        pulseLevels[pulseCount] = currentLevel ? 0 : 1; 
+        pulseCount++;
+    }
+}
+
+void setup() {
+    // Force a 4-second delay so the virtual COM port maps before anything fires
+    delay(4000);
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n--- STEP 1: COMPILER BOOT SUCCESSFUL ---");
+    
+    Serial.println("--- STEP 2: CONFIGURING GPIO DIRECTIONS ---");
+    pinMode(CC1101_CS, OUTPUT);
+    digitalWrite(CC1101_CS, HIGH);
+    pinMode(CC1101_GDO0, INPUT);
+    Serial.println("GPIO Directions configured.");
+
+    Serial.println("--- STEP 3: MAPPING CC1101 SPI PIN TRACES ---");
+    ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+    ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
+    Serial.println("Pin traces mapped.");
+
+    Serial.println("--- STEP 4: COMMITTING CC1101 INTERFACE RESET ---");
+    Serial.flush();
+    
+    // Crucial validation point: If SPI wiring is bad, execution will die right here
+    ELECHOUSE_cc1101.Init();
+    Serial.println("Interface reset acknowledged.");
+
+    Serial.println("--- STEP 5: WRITING INTERNAL CHIP PARAMETERS ---");
+    ELECHOUSE_cc1101.setMHZ(319.50);
+    ELECHOUSE_cc1101.setModulation(2); 
+    ELECHOUSE_cc1101.setCCMode(0);
+    ELECHOUSE_cc1101.setPktFormat(3);  
+    ELECHOUSE_cc1101.setRxBW(203.00);   
+    ELECHOUSE_cc1101.setDRate(16.38);
+    ELECHOUSE_cc1101.setSyncMode(0);
+    ELECHOUSE_cc1101.setManchester(0);
+    ELECHOUSE_cc1101.setCrc(0);
+    Serial.println("Internal registers updated.");
+
+    Serial.println("--- STEP 6: STARTING RX DATA STRIPS ---");
+    ELECHOUSE_cc1101.SetRx();
+    Serial.println("Radio listening active.");
+
+    Serial.println("--- STEP 7: HOOKING INTERRUPT SERVICING VECTORS ---");
+    lastEdgeMicros = micros();
+    attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), gdo0ISR, CHANGE);
+    
+    Serial.println("\n===============================================");
+    Serial.println("=== NOISE-FILTERED BLIND PULSE LOGGER ONLINE ===");
+    Serial.println("===============================================");
+}
+
+void loop() {
+    uint32_t now = micros();
+    if (burstActive && ((uint32_t)(now - lastEdgeMicros) > BURST_GAP_US)) {
+        noInterrupts();
+        trackingReady = true;
+        uint16_t finalCount = pulseCount;
+        interrupts();
+
+        if (finalCount > 60) {
+            Serial.printf("\n--- TRANSACTION CAPTURED (%d Pulses) ---\n", finalCount);
+            for (uint16_t i = 0; i < finalCount; i++) {
+                Serial.printf("%s%d ", pulseLevels[i] ? "H" : "L", pulseDurations[i]);
+                if ((i + 1) % 15 == 0) Serial.println(); 
+            }
+            Serial.println("\n----------------------------------------------");
+        }
+
+        noInterrupts();
+        pulseCount = 0;
+        burstActive = false;
+        trackingReady = false;
+        interrupts();
+    }
+    yield();
+}
+
