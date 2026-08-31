@@ -1,3 +1,5 @@
+// Replace "id here" with your sensor’s unique ID (hex value from RF capture) must have sensor IDs to run 
+
 // ============================================================
 // BLOCK 1: LIBRARIES, CONFIGURATIONS, AND STRUCTURES
 // ============================================================
@@ -9,9 +11,9 @@
 #include <esp_wifi.h>
 #include <time.h>
 
-const char *ssid = "SSID";
-const char *password = "WIFI PASS";
-const char *syslogServer = "SERVER IP FOR SYSLOG";
+const char *ssid = "SSID here";
+const char *password = "SSID PASS";
+const char *syslogServer = "syslog server ip";
 const int syslogPort = 514;
 
 #define CC1101_SCK 1
@@ -39,8 +41,8 @@ const KnownSensor SENSOR_LIST_RAW[] = {
     {id here, "Front Door Contact"},
     {id here, "Main Garage Door"},
     {id here, "Side Garage Door"},
-    {id here, "Attic Heat Sensor 1"}, //future use 
-    {id here, "Attic Heat Sensor 2"}, //future use
+    {id here, "Attic Heat Sensor 1"}, //future integration 
+    {id here, "Attic Heat Sensor 2"},
     {id here, "Living Room Motion"},
     {id here, "Office Motion"}};
 const KnownSensor *SENSOR_LIST = SENSOR_LIST_RAW;
@@ -144,6 +146,7 @@ uint8_t baseR = 40, baseG = 20, baseB = 0;
 LogItem logQueue[LOG_QUEUE_SIZE];
 volatile uint8_t logQueueHead = 0;
 volatile uint8_t logQueueTail = 0;
+portMUX_TYPE logQueueMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Forward Declarations
 void checkLedTimeout();
@@ -242,6 +245,67 @@ void endSession()
     lastEdgeMicros = micros();
     interrupts();
 }
+
+bool isSupervisorFrame(const RFBurst &b, uint8_t statusByte, uint32_t sensorID)
+{
+    uint32_t maxPulse = 0;
+    uint32_t longPulseCount = 0;
+    for (int i = 0; i < b.count; i++)
+    {
+        if (b.duration[i] > maxPulse)
+            maxPulse = b.duration[i];
+        if (b.duration[i] > 5000)
+            longPulseCount++;
+    }
+    bool looksLikeSupervisor = (maxPulse > 5000 || longPulseCount > 3);
+
+    // Rear Door Contact
+    if (sensorID == id here)
+    {
+        if (statusByte >= 0x28 && statusByte <= 0x2F)
+        {
+            return false; // Always treat as event if in valid range
+        }
+    }
+    // Front Door Contact
+    else if (sensorID == id here)
+    {
+        if (statusByte >= 0xA8 && statusByte <= 0xAF)
+        {
+            return false;
+        }
+    }
+    // Garage Doors
+    else if (sensorID == id here || sensorID == id here)
+    {
+        if (statusByte >= 0x50 && statusByte <= 0x5E)
+        {
+            return false;
+        }
+    }
+    // Motion Sensors
+    else if (sensorID == id here || sensorID == id here)
+    {
+        // Decode status byte flags
+        bool lowBattery = (statusByte & 0x01) != 0;
+        bool tamper = (statusByte & 0x02) != 0;
+        bool motionBit = (statusByte & 0x04) != 0;
+
+        // Active motion if motion bit set OR known observed codes
+        bool activeMotion = motionBit ||
+                            (statusByte == 0x0A) ||
+                            (statusByte == 0x14);
+
+        if (activeMotion)
+        {
+            return false; // treat as event
+        }
+    }
+
+    // Default: supervisor if long gaps or unknown status
+    return looksLikeSupervisor;
+}
+
 // ============================================================
 // BLOCK 3 (PART 1): ITI DECODER MESSAGE PARSING ENGINE
 // ============================================================
@@ -320,6 +384,41 @@ void processUnifiedSessionRoll()
                 local_byte_frame.data[i / 8] |= (1 << (7 - (i % 8)));
             }
         }
+        // After building local_byte_frame
+        uint8_t idByte3 = local_byte_frame.data[3];
+
+        // Transmission type flag is embedded in the high nibble of Byte 3
+        bool isPhysicalEvent = ((idByte3 >> 4) & 0x01); // odd nibble = physical
+        bool isSupervisorEvent = !isPhysicalEvent;      // even nibble = supervisor
+
+        /*Serial.printf("[DEBUG] Byte3: 0x%02X | Physical=%d | Supervisor=%d\n",
+                      idByte3, isPhysicalEvent, isSupervisorEvent);*/
+
+        // Find last meaningful bit
+        int lastOneIndex = -1;
+        for (int i = 0; i < bitCount; i++)
+        {
+            if (local_bit_stream.data[i] == 1)
+            {
+                lastOneIndex = i;
+            }
+        }
+
+        // Print only up to lastOneIndex
+        Serial.print("[BITSTREAM] ");
+        for (int i = 0; i <= lastOneIndex; i++)
+        {
+            Serial.print(local_bit_stream.data[i]);
+        }
+        Serial.println();
+
+        /*Serial.print("[PULSE WIDTHS] ");
+        for (int i = 0; i < b.count; i++)
+        {
+            Serial.print(b.duration[i]);
+            Serial.print(",");
+        }
+        Serial.println();*/
 
         uint32_t sensorID = ((uint32_t)local_byte_frame.data[1] << 16) |
                             ((uint32_t)local_byte_frame.data[2] << 8) |
@@ -339,10 +438,10 @@ void processUnifiedSessionRoll()
             continue;
 
         // test point
-        /*Serial.printf("[SENSOR_RAW] MATCHED: %s | ID: 0x%06X | Bytes: %02X %02X %02X %02X %02X\n",
+        Serial.printf("[SENSOR_RAW] MATCHED: %s | ID: 0x%06X | Bytes: %02X %02X %02X %02X %02X\n",
                       (SENSOR_LIST + listIdx)->name, sensorID, local_byte_frame.data[0],
                       local_byte_frame.data[1], local_byte_frame.data[2],
-                      local_byte_frame.data[3], local_byte_frame.data[4]);*/
+                      local_byte_frame.data[3], local_byte_frame.data[4]);
 
         ScratchpadState *targetCell = sessionCache + listIdx;
         targetCell->id = sensorID;
@@ -353,18 +452,21 @@ void processUnifiedSessionRoll()
         bool isMotionSensor = (sensorID == 0x0B1EAA || sensorID == 0x0824C6);
         bool calculatedOpen = false;
 
-        // --- 1. REAR DOOR (2C = open, 2A = closed) ---
-        if (sensorID == id here)
+        // --- SENSOR CLASSIFICATION WITH PULSE WIDTH + STATUS BYTE ---
+        if (sensorID == id here) // Rear Door Contact
         {
-            if (statusByte == 0x2C || statusByte == 0x2E || statusByte == 0x2D || statusByte == 0x2F)
+            if (!isSupervisorFrame(b, statusByte, sensorID))
             {
-                calculatedOpen = false;
-                targetCell->sawPhysicalEvent = true;
-            }
-            else if (statusByte == 0x2A || statusByte == 0x28 || statusByte == 0x29 || statusByte == 0x2B)
-            {
-                calculatedOpen = true;
-                targetCell->sawPhysicalEvent = true;
+                if (statusByte >= 0x2C && statusByte <= 0x2F)
+                {
+                    calculatedOpen = true; // OPEN
+                    targetCell->sawPhysicalEvent = true;
+                }
+                else if (statusByte >= 0x28 && statusByte <= 0x2B)
+                {
+                    calculatedOpen = false; // CLOSED
+                    targetCell->sawPhysicalEvent = true;
+                }
             }
             else
             {
@@ -372,18 +474,20 @@ void processUnifiedSessionRoll()
                 logSupervisor(sensorID, statusByte);
             }
         }
-        // --- 2. FRONT DOOR (AD = open, AB = closed) ---
-        else if (sensorID == id here)
+        else if (sensorID == id here) // Front Door Contact
         {
-            if (statusByte == 0xAD || statusByte == 0xAF || statusByte == 0xAC || statusByte == 0xAE)
+            if (!isSupervisorFrame(b, statusByte, sensorID))
             {
-                calculatedOpen = true;
-                targetCell->sawPhysicalEvent = true;
-            }
-            else if (statusByte == 0xAB || statusByte == 0xA9 || statusByte == 0xAA || statusByte == 0xA8)
-            {
-                calculatedOpen = false;
-                targetCell->sawPhysicalEvent = true;
+                if (statusByte >= 0xAC && statusByte <= 0xAF)
+                {
+                    calculatedOpen = true; // OPEN
+                    targetCell->sawPhysicalEvent = true;
+                }
+                else if (statusByte >= 0xA8 && statusByte <= 0xAB)
+                {
+                    calculatedOpen = false; // CLOSED
+                    targetCell->sawPhysicalEvent = true;
+                }
             }
             else
             {
@@ -391,18 +495,20 @@ void processUnifiedSessionRoll()
                 logSupervisor(sensorID, statusByte);
             }
         }
-        // --- 3. MAIN GARAGE DOOR ---
-        else if (sensorID == id here)
+        else if (sensorID == id here) // Main Garage Door
         {
-            if (statusByte >= 0x58 && statusByte <= 0x5E)
+            if (!isSupervisorFrame(b, statusByte, sensorID))
             {
-                calculatedOpen = true;
-                targetCell->sawPhysicalEvent = true;
-            }
-            else if (statusByte >= 0x50 && statusByte <= 0x56)
-            {
-                calculatedOpen = false;
-                targetCell->sawPhysicalEvent = true;
+                if (statusByte >= 0x58 && statusByte <= 0x5E)
+                {
+                    calculatedOpen = true; // OPEN
+                    targetCell->sawPhysicalEvent = true;
+                }
+                else if (statusByte >= 0x50 && statusByte <= 0x56)
+                {
+                    calculatedOpen = false; // CLOSED
+                    targetCell->sawPhysicalEvent = true;
+                }
             }
             else
             {
@@ -410,18 +516,20 @@ void processUnifiedSessionRoll()
                 logSupervisor(sensorID, statusByte);
             }
         }
-        // --- 4. SIDE GARAGE DOOR ---
-        else if (sensorID == id here)
+        else if (sensorID == id here) // Side Garage Door
         {
-            if (statusByte >= 0x58 && statusByte <= 0x5E)
+            if (!isSupervisorFrame(b, statusByte, sensorID))
             {
-                calculatedOpen = false;
-                targetCell->sawPhysicalEvent = true;
-            }
-            else if (statusByte >= 0x50 && statusByte <= 0x56)
-            {
-                calculatedOpen = true;
-                targetCell->sawPhysicalEvent = true;
+                if (statusByte >= 0x58 && statusByte <= 0x5E)
+                {
+                    calculatedOpen = false; // CLOSED
+                    targetCell->sawPhysicalEvent = true;
+                }
+                else if (statusByte >= 0x50 && statusByte <= 0x56)
+                {
+                    calculatedOpen = true; // OPEN
+                    targetCell->sawPhysicalEvent = true;
+                }
             }
             else
             {
@@ -429,32 +537,33 @@ void processUnifiedSessionRoll()
                 logSupervisor(sensorID, statusByte);
             }
         }
-        // --- 5. MOTION SENSORS & DEFAULTS ---
-        else
+        else // Motion Sensors & Defaults
         {
-            // Interlogix motion sensors typically set bit 0x10 or 0x20 during a background check-in.
-            // If bit 0x04 or 0x02 (the active motion loops) are NOT tripped, but a packet arrives, it is a supervisor check-in.
-            bool activeMotion = ((statusByte & 0x02) != 0) || ((statusByte & 0x04) != 0);
+            // Decode status byte flags
+            bool lowBattery = (statusByte & 0x01) != 0;
+            bool tamper = (statusByte & 0x02) != 0;
+            bool motionBit = (statusByte & 0x04) != 0;
 
-            // Check for supervisor bits (commonly 0x10 or 0x20 in Interlogix telemetry)
-            bool isSupervisorPacket = (statusByte & 0x30) != 0 && !activeMotion;
+            // Active motion if motion bit set OR known observed codes
+            bool activeMotion = motionBit ||
+                                (statusByte == 0x0A) ||
+                                (statusByte == 0x14);
 
-            if (isSupervisorPacket)
+            if (!isSupervisorFrame(b, statusByte, sensorID))
+            {
+                targetCell->sawPhysicalEvent = true;
+                targetCell->sawSupervisor = false;
+                calculatedOpen = activeMotion; // motion detected
+            }
+            else
             {
                 targetCell->sawSupervisor = true;
                 targetCell->sawPhysicalEvent = false;
                 logSupervisor(sensorID, statusByte);
             }
-            else
-            {
-                targetCell->sawPhysicalEvent = true;
-                targetCell->sawSupervisor = false;
-                calculatedOpen = activeMotion;
-            }
         }
 
         targetCell->isOpen = calculatedOpen;
-
     }
 
     // ============================================================
@@ -493,13 +602,13 @@ void processUnifiedSessionRoll()
                 liveCache[cacheIdx].lastSupervisorLogTime = 0;
                 liveCache[cacheIdx].pendingConfirmCount = 0;
 
-                if (sID == 0x1C274E || sID == 0x1ACA8B)
+                if (sID == 0x1C274E || sID == id here) //garage tilt take a while to settle
                 {
                     liveCache[cacheIdx].confirmTimeout = 6000;
                 }
                 else
                 {
-                    liveCache[cacheIdx].confirmTimeout = 1990;
+                    liveCache[cacheIdx].confirmTimeout = 2300;
                 }
 
                 if (cell->sawSupervisor && !cell->sawPhysicalEvent)
@@ -651,27 +760,39 @@ void enqueueLog(const char *format, ...)
     uint8_t nextHead = (logQueueHead + 1) % LOG_QUEUE_SIZE;
     if (nextHead == logQueueTail)
         return;
+
     va_list args;
     va_start(args, format);
-    vsnprintf(logQueue[nextHead].message_storage.text, sizeof(logQueue[nextHead].message_storage.text), format, args);
-    va_end(args);
+
+    portENTER_CRITICAL(&logQueueMux); // <-- add
+    vsnprintf(logQueue[nextHead].message_storage.text,
+              sizeof(logQueue[nextHead].message_storage.text),
+              format, args);
     logQueueHead = nextHead;
+    portEXIT_CRITICAL(&logQueueMux); // <-- add
+
+    va_end(args);
 }
 
 void processLogQueue()
 {
     if (logQueueTail == logQueueHead)
         return;
+
+    portENTER_CRITICAL(&logQueueMux); // <-- add
     uint8_t nextTail = (logQueueTail + 1) % LOG_QUEUE_SIZE;
     char *msg = logQueue[nextTail].message_storage.text;
+    logQueueTail = nextTail;
+    portEXIT_CRITICAL(&logQueueMux); // <-- add
+
     Serial.println(msg);
+
     if (WiFi.status() == WL_CONNECTED)
     {
         time_t rawNow = time(nullptr);
         time_t localNow = rawNow - 25200;
         struct tm *timeinfo = gmtime(&localNow);
 
-        // Move them here! Now they are completely isolated local variables.
         char local_string_time[64];
         uint8_t local_string_payload[512];
 
@@ -689,7 +810,6 @@ void processLogQueue()
             UdpClient.endPacket();
         }
     }
-    logQueueTail = nextTail;
 }
 
 void logSupervisor(uint32_t sensorID, uint8_t statusByte)
@@ -815,7 +935,7 @@ void setup()
     initCC1101();
     // Permit metadata
     const char *alarmPermitInfo =
-        "Alarm Permit #NUMBER HERE (Valid date to date)";
+        "City of _____ Alarm Permit #____ (Valid start date to end date)";
     if (WiFi.status() == WL_CONNECTED)
     {
         Serial.println("[TEST] Launching official localized protocol boot packet...");
