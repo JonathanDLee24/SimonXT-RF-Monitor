@@ -1,5 +1,8 @@
-// Replace "id here" with your sensor’s unique ID (hex value from RF capture) must have sensor IDs to run 
-
+// Drop-in Simon XT full-field, RAM-only state-machine build.
+//
+// Contact state comes from the observed debounced-level field, never from
+// the rolling status prefix. Periodic supervisor packets may advance the
+// trigger counter, but cannot overwrite an initialized OPEN/CLOSED state.
 // ============================================================
 // BLOCK 1: LIBRARIES, CONFIGURATIONS, AND STRUCTURES
 // ============================================================
@@ -11,9 +14,9 @@
 #include <esp_wifi.h>
 #include <time.h>
 
-const char *ssid = "SSID here";
-const char *password = "SSID PASS";
-const char *syslogServer = "syslog server ip";
+const char *ssid = "wifi ssid here";
+const char *password = "wifi password";
+const char *syslogServer = "syslog ip address";
 const int syslogPort = 514;
 
 #define CC1101_SCK 1
@@ -30,6 +33,15 @@ const int syslogPort = 514;
 #define SESSION_END_GAP_US 200000
 #define MIN_TRANSITIONS 100
 
+// Set to 0 after field validation to reduce serial output.
+#define RF_DEBUG 0
+
+// Set to 1 only when supervisor-health messages are needed in syslog.
+// Supervisor packets are still decoded when this is 0; only their logs
+// are suppressed.
+#define LOG_SUPERVISORS 0
+#define SUPERVISOR_LOG_INTERVAL_MS 86400000UL // 24 hours
+
 struct KnownSensor
 {
     uint32_t id;
@@ -41,8 +53,8 @@ const KnownSensor SENSOR_LIST_RAW[] = {
     {id here, "Front Door Contact"},
     {id here, "Main Garage Door"},
     {id here, "Side Garage Door"},
-    {id here, "Attic Heat Sensor 1"}, //future integration 
-    {id here, "Attic Heat Sensor 2"},
+    {id here, "Attic Heat Sensor 1"}, //future use code will be needed for battery check in as this only changes state in a fire this is not for premises monitoring
+    {id here, "Attic Heat Sensor 2"}, //future use sensors like this are only for immediate alarm siren and not for premises monitoring outside of battery low and the panel does that 
     {id here, "Living Room Motion"},
     {id here, "Office Motion"}};
 const KnownSensor *SENSOR_LIST = SENSOR_LIST_RAW;
@@ -64,10 +76,25 @@ struct LiveTracker
     bool initialized;
     unsigned long lastEventTime;
     unsigned long lastSupervisorLogTime;
-    unsigned long blastSquelchTimer;
-    uint8_t pendingConfirmCount;    // confirmation counter
-    unsigned long confirmStartTime; // when counter started
-    unsigned long confirmTimeout;   // per-sensor timeout window
+
+    // Physical contact/garage events and motion events are intentionally
+    // tracked independently. The on-air trigger counter is three bits and
+    // bit-reversed in the captured status byte. OPEN and CLOSE may still
+    // share one counter value on the garage transmitters.
+    uint8_t lastPhysicalCounter;
+    bool physicalCounterValid;
+    uint8_t lastMotionCounter;
+    bool motionCounterValid;
+
+    // Candidate event must contain the SAME counter and SAME decoded state
+    // in multiple physical frames before it can change the reported state.
+    uint8_t candidateCounter;
+    bool candidateState;
+    uint8_t candidateConfirmCount;
+    unsigned long candidateStartTime;
+
+    // Per-sensor confirmation window.
+    unsigned long confirmTimeout;
 };
 
 struct SensorState
@@ -160,6 +187,7 @@ void endSession();
 void saveCurrentBurst();
 void gdo0ISR();
 void logSupervisor(uint32_t sensorID, uint8_t statusByte);
+int findCacheIndex(uint32_t sensorID);
 
 void IRAM_ATTR gdo0ISR()
 {
@@ -246,69 +274,88 @@ void endSession()
     interrupts();
 }
 
-bool isSupervisorFrame(const RFBurst &b, uint8_t statusByte, uint32_t sensorID)
+static bool isMotionSensor(uint32_t sensorID)
 {
-    uint32_t maxPulse = 0;
-    uint32_t longPulseCount = 0;
-    for (int i = 0; i < b.count; i++)
-    {
-        if (b.duration[i] > maxPulse)
-            maxPulse = b.duration[i];
-        if (b.duration[i] > 5000)
-            longPulseCount++;
-    }
-    bool looksLikeSupervisor = (maxPulse > 5000 || longPulseCount > 3);
-
-    // Rear Door Contact
-    if (sensorID == id here)
-    {
-        if (statusByte >= 0x28 && statusByte <= 0x2F)
-        {
-            return false; // Always treat as event if in valid range
-        }
-    }
-    // Front Door Contact
-    else if (sensorID == id here)
-    {
-        if (statusByte >= 0xA8 && statusByte <= 0xAF)
-        {
-            return false;
-        }
-    }
-    // Garage Doors
-    else if (sensorID == id here || sensorID == id here)
-    {
-        if (statusByte >= 0x50 && statusByte <= 0x5E)
-        {
-            return false;
-        }
-    }
-    // Motion Sensors
-    else if (sensorID == id here || sensorID == id here)
-    {
-        // Decode status byte flags
-        bool lowBattery = (statusByte & 0x01) != 0;
-        bool tamper = (statusByte & 0x02) != 0;
-        bool motionBit = (statusByte & 0x04) != 0;
-
-        // Active motion if motion bit set OR known observed codes
-        bool activeMotion = motionBit ||
-                            (statusByte == 0x0A) ||
-                            (statusByte == 0x14);
-
-        if (activeMotion)
-        {
-            return false; // treat as event
-        }
-    }
-
-    // Default: supervisor if long gaps or unknown status
-    return looksLikeSupervisor;
+    return sensorID == id here || sensorID == id here;
 }
 
-// ============================================================
-// BLOCK 3 (PART 1): ITI DECODER MESSAGE PARSING ENGINE
-// ============================================================
+static bool isDoorContact(uint32_t sensorID)
+{
+    return sensorID == id here || sensorID == id here;
+}
+
+static bool isGarageSensor(uint32_t sensorID)
+{
+    return sensorID == id here || sensorID == id here;
+}
+
+// Decode the stable level and the event latches observed in the complete
+// field captures. Returns false for sensors that do not have an OPEN/CLOSED
+// state. "physicalEvent" is false for a periodic supervisor packet.
+static bool decodeContactFrame(uint32_t sensorID,
+                               const BitStreamBuffer &bits,
+                               uint16_t bitCount,
+                               bool &state,
+                               bool &physicalEvent,
+                               bool &positiveLatch,
+                               bool &negativeLatch)
+{
+    positiveLatch = false;
+    negativeLatch = false;
+
+    if (isDoorContact(sensorID))
+    {
+        // Rear and Front contacts use the observed F5 fields:
+        //   data[49] = positive/open latch
+        //   data[50] = debounced level (1 OPEN, 0 CLOSED)
+        //   data[51] = negative/close latch
+        if (bitCount < 52)
+            return false;
+
+        positiveLatch = bits.data[49] != 0;
+        state = bits.data[50] != 0;
+        negativeLatch = bits.data[51] != 0;
+        physicalEvent = positiveLatch || negativeLatch;
+        return true;
+    }
+
+    if (isGarageSensor(sensorID))
+    {
+        // Both garage transmitters use data[41] as the stable level:
+        //   52 D1... = OPEN
+        //   5A 11... = CLOSED
+        // A negative transition asserts both observed latch fields. Some
+        // later supervisor cycles can retain one of them, so STEP 2 still
+        // makes the stable level—not the counter or prefix—the final guard.
+        if (bitCount < 44)
+            return false;
+
+        positiveLatch = bits.data[40] != 0;
+        state = bits.data[41] != 0;
+        negativeLatch = bits.data[36] != 0 && bits.data[43] != 0;
+        physicalEvent = positiveLatch || negativeLatch;
+        return true;
+    }
+
+    return false;
+}
+
+static bool decodeMotionEvent(uint8_t statusByte)
+{
+    bool motionBit = (statusByte & 0x04) != 0;
+    return motionBit || statusByte == 0x0A || statusByte == 0x14;
+}
+
+static uint8_t decodeEventCounter(uint8_t statusByte)
+{
+    // The three on-air counter bits occupy status[2:0] in reverse bit order.
+    // Example sequence: 1,5,3,7,0,4,2,6 decodes to 4,5,6,7,0,1,2,3.
+    uint8_t encoded = statusByte & 0x07;
+    return ((encoded & 0x01) << 2) |
+           (encoded & 0x02) |
+           ((encoded & 0x04) >> 2);
+}
+
 void processUnifiedSessionRoll()
 {
     noInterrupts();
@@ -322,25 +369,39 @@ void processUnifiedSessionRoll()
     {
         uint32_t id;
         const char *name;
-        bool isOpen;
-        bool isLowBattery;
-        bool isTampered;
-        bool seen;
+
+        // Supervisor information is kept separately from physical data.
         bool sawSupervisor;
+        uint8_t supervisorStatus;
+        uint8_t supervisorCounter;
+        bool supervisorStateValid;
+        bool supervisorState;
+        uint8_t supervisorConfirmCount;
+
+        // Physical event candidate.
         bool sawPhysicalEvent;
-        uint8_t lastRawStatus;
+        bool physicalStateValid;
+        bool physicalState;
+        uint8_t physicalCounter;
+        uint8_t physicalConfirmCount;
+
+        // Motion has no open/closed meaning.
+        bool sawMotionEvent;
+        uint8_t motionCounter;
+        uint8_t motionConfirmCount;
+
+        bool seen;
     };
 
     ScratchpadState sessionCache[SENSOR_COUNT];
-    for (int i = 0; i < SENSOR_COUNT; i++)
-    {
-        *(sessionCache + i) = {0, nullptr, false, false, false, false, false, false, 0};
-    }
+    memset(sessionCache, 0, sizeof(sessionCache));
 
-    // --- STEP 1: DECODE INDIVIDUAL RF BURSTS LOCAL TO FUNCTION STACK ---
+    // ============================================================
+    // STEP 1: DECODE EVERY RF BURST
+    // ============================================================
     for (uint16_t bIdx = 0; bIdx < totalBurSTS; bIdx++)
     {
-        const RFBurst &b = *(sessionBurSTS + bIdx);
+        const RFBurst &b = sessionBurSTS[bIdx];
 
         BitStreamBuffer local_bit_stream;
         memset(local_bit_stream.data, 0, sizeof(local_bit_stream.data));
@@ -351,405 +412,480 @@ void processUnifiedSessionRoll()
         {
             if (b.duration[i] > 10000)
                 continue;
+
             uint32_t units = (b.duration[i] + (BASE_UNIT_US / 2)) / BASE_UNIT_US;
             if (units < 1)
                 units = 1;
+
             if (b.level[i] == 1 && units >= 7)
             {
                 syncFound = true;
                 bitCount = 0;
                 continue;
             }
+
             if (syncFound && b.level[i] == 0)
             {
-                if (units == 1)
-                    local_bit_stream.data[bitCount] = 0;
-                else if (units == 2)
-                    local_bit_stream.data[bitCount] = 1;
-                bitCount++;
+                // Preserve the original decoder timing behavior.
+                // A low pulse is a bit slot; 1 unit = 0, 2 units = 1.
+                // For compatibility with the working decoder, advance the
+                // bit position for every low pulse and leave unrecognized
+                // widths as zero.
+                if (bitCount < 128)
+                {
+                    if (units == 1)
+                        local_bit_stream.data[bitCount] = 0;
+                    else if (units == 2)
+                        local_bit_stream.data[bitCount] = 1;
+                    else
+                        local_bit_stream.data[bitCount] = 0;
+                    bitCount++;
+                }
                 if (bitCount >= 128)
                     break;
             }
         }
 
+        // Forty bits are enough to identify a known transmitter and read its
+        // status byte. decodeContactFrame() applies the stricter per-device
+        // minimum before it touches each stable-level/latch field.
         if (bitCount < 40)
             continue;
 
         ByteFrameBuffer local_byte_frame;
         memset(local_byte_frame.data, 0, sizeof(local_byte_frame.data));
+
         for (uint16_t i = 0; i < 40; i++)
         {
             if (local_bit_stream.data[i] == 1)
-            {
                 local_byte_frame.data[i / 8] |= (1 << (7 - (i % 8)));
-            }
         }
-        // After building local_byte_frame
-        uint8_t idByte3 = local_byte_frame.data[3];
-
-        // Transmission type flag is embedded in the high nibble of Byte 3
-        bool isPhysicalEvent = ((idByte3 >> 4) & 0x01); // odd nibble = physical
-        bool isSupervisorEvent = !isPhysicalEvent;      // even nibble = supervisor
-
-        /*Serial.printf("[DEBUG] Byte3: 0x%02X | Physical=%d | Supervisor=%d\n",
-                      idByte3, isPhysicalEvent, isSupervisorEvent);*/
-
-        // Find last meaningful bit
-        int lastOneIndex = -1;
-        for (int i = 0; i < bitCount; i++)
-        {
-            if (local_bit_stream.data[i] == 1)
-            {
-                lastOneIndex = i;
-            }
-        }
-
-        // Print only up to lastOneIndex
-        Serial.print("[BITSTREAM] ");
-        for (int i = 0; i <= lastOneIndex; i++)
-        {
-            Serial.print(local_bit_stream.data[i]);
-        }
-        Serial.println();
-
-        /*Serial.print("[PULSE WIDTHS] ");
-        for (int i = 0; i < b.count; i++)
-        {
-            Serial.print(b.duration[i]);
-            Serial.print(",");
-        }
-        Serial.println();*/
 
         uint32_t sensorID = ((uint32_t)local_byte_frame.data[1] << 16) |
                             ((uint32_t)local_byte_frame.data[2] << 8) |
                             local_byte_frame.data[3];
+
         uint8_t statusByte = local_byte_frame.data[4];
+        // The trigger counter is encoded in status bits 2:0, bit-reversed.
+        // Periodic supervisors advance it, and garage OPEN/CLOSE packets can
+        // also legitimately share one counter.
+        uint8_t currentCounter = decodeEventCounter(statusByte);
 
         int listIdx = -1;
-        for (int i = 0; i < SENSOR_COUNT; i++)
+        for (size_t i = 0; i < SENSOR_COUNT; i++)
         {
             if (sensorID == (SENSOR_LIST + i)->id)
             {
-                listIdx = i;
+                listIdx = static_cast<int>(i);
                 break;
             }
         }
+
         if (listIdx == -1)
             continue;
 
-        // test point
-        Serial.printf("[SENSOR_RAW] MATCHED: %s | ID: 0x%06X | Bytes: %02X %02X %02X %02X %02X\n",
-                      (SENSOR_LIST + listIdx)->name, sensorID, local_byte_frame.data[0],
-                      local_byte_frame.data[1], local_byte_frame.data[2],
-                      local_byte_frame.data[3], local_byte_frame.data[4]);
+#if RF_DEBUG
+        Serial.printf("[FULL_BITS count=%u] ", bitCount);
 
-        ScratchpadState *targetCell = sessionCache + listIdx;
-        targetCell->id = sensorID;
-        targetCell->name = (SENSOR_LIST + listIdx)->name;
-        targetCell->lastRawStatus = statusByte;
-        targetCell->seen = true;
-
-        bool isMotionSensor = (sensorID == 0x0B1EAA || sensorID == 0x0824C6);
-        bool calculatedOpen = false;
-
-        // --- SENSOR CLASSIFICATION WITH PULSE WIDTH + STATUS BYTE ---
-        if (sensorID == id here) // Rear Door Contact
+        for (uint16_t i = 0; i < bitCount; i++)
         {
-            if (!isSupervisorFrame(b, statusByte, sensorID))
-            {
-                if (statusByte >= 0x2C && statusByte <= 0x2F)
-                {
-                    calculatedOpen = true; // OPEN
-                    targetCell->sawPhysicalEvent = true;
-                }
-                else if (statusByte >= 0x28 && statusByte <= 0x2B)
-                {
-                    calculatedOpen = false; // CLOSED
-                    targetCell->sawPhysicalEvent = true;
-                }
-            }
-            else
-            {
-                targetCell->sawSupervisor = true;
-                logSupervisor(sensorID, statusByte);
-            }
+            Serial.print(local_bit_stream.data[i]);
+
+            if ((i & 0x07) == 0x07 && i + 1 < bitCount)
+                Serial.print(' ');
         }
-        else if (sensorID == id here) // Front Door Contact
-        {
-            if (!isSupervisorFrame(b, statusByte, sensorID))
-            {
-                if (statusByte >= 0xAC && statusByte <= 0xAF)
-                {
-                    calculatedOpen = true; // OPEN
-                    targetCell->sawPhysicalEvent = true;
-                }
-                else if (statusByte >= 0xA8 && statusByte <= 0xAB)
-                {
-                    calculatedOpen = false; // CLOSED
-                    targetCell->sawPhysicalEvent = true;
-                }
-            }
-            else
-            {
-                targetCell->sawSupervisor = true;
-                logSupervisor(sensorID, statusByte);
-            }
-        }
-        else if (sensorID == id here) // Main Garage Door
-        {
-            if (!isSupervisorFrame(b, statusByte, sensorID))
-            {
-                if (statusByte >= 0x58 && statusByte <= 0x5E)
-                {
-                    calculatedOpen = true; // OPEN
-                    targetCell->sawPhysicalEvent = true;
-                }
-                else if (statusByte >= 0x50 && statusByte <= 0x56)
-                {
-                    calculatedOpen = false; // CLOSED
-                    targetCell->sawPhysicalEvent = true;
-                }
-            }
-            else
-            {
-                targetCell->sawSupervisor = true;
-                logSupervisor(sensorID, statusByte);
-            }
-        }
-        else if (sensorID == id here) // Side Garage Door
-        {
-            if (!isSupervisorFrame(b, statusByte, sensorID))
-            {
-                if (statusByte >= 0x58 && statusByte <= 0x5E)
-                {
-                    calculatedOpen = false; // CLOSED
-                    targetCell->sawPhysicalEvent = true;
-                }
-                else if (statusByte >= 0x50 && statusByte <= 0x56)
-                {
-                    calculatedOpen = true; // OPEN
-                    targetCell->sawPhysicalEvent = true;
-                }
-            }
-            else
-            {
-                targetCell->sawSupervisor = true;
-                logSupervisor(sensorID, statusByte);
-            }
-        }
-        else // Motion Sensors & Defaults
-        {
-            // Decode status byte flags
-            bool lowBattery = (statusByte & 0x01) != 0;
-            bool tamper = (statusByte & 0x02) != 0;
-            bool motionBit = (statusByte & 0x04) != 0;
 
-            // Active motion if motion bit set OR known observed codes
-            bool activeMotion = motionBit ||
-                                (statusByte == 0x0A) ||
-                                (statusByte == 0x14);
+        Serial.println();
 
-            if (!isSupervisorFrame(b, statusByte, sensorID))
+        uint16_t byteCount = (bitCount + 7) / 8;
+        Serial.printf("[FULL_HEX bytes=%u] ", byteCount);
+
+        for (uint16_t byteIndex = 0; byteIndex < byteCount; byteIndex++)
+        {
+            uint8_t value = 0;
+
+            for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++)
             {
-                targetCell->sawPhysicalEvent = true;
-                targetCell->sawSupervisor = false;
-                calculatedOpen = activeMotion; // motion detected
+                uint16_t sourceIndex = byteIndex * 8 + bitIndex;
+
+                if (sourceIndex < bitCount &&
+                    local_bit_stream.data[sourceIndex])
+                {
+                    value |= 1 << (7 - bitIndex);
+                }
             }
-            else
+
+            Serial.printf("%02X", value);
+
+            if (byteIndex + 1 < byteCount)
+                Serial.print(' ');
+        }
+
+        Serial.println();
+#endif
+
+        ScratchpadState *cell = &sessionCache[listIdx];
+        cell->id = sensorID;
+        cell->name = (SENSOR_LIST + listIdx)->name;
+        cell->seen = true;
+
+        bool motionSensor = isMotionSensor(sensorID);
+        bool decodedState = false;
+        bool stateFieldValid = false;
+        bool positiveLatch = false;
+        bool negativeLatch = false;
+        bool physicalEvent = false;
+        bool supervisor = true;
+
+        if (motionSensor)
+        {
+            // Counter advancement alone cannot mean motion: untouched Office
+            // supervisor packets were observed advancing the counter. Keep
+            // the proven motion indication and treat the clear phase as
+            // supervisor/rest traffic.
+            supervisor = !decodeMotionEvent(statusByte);
+        }
+        else
+        {
+            stateFieldValid = decodeContactFrame(sensorID,
+                                                 local_bit_stream,
+                                                 bitCount,
+                                                 decodedState,
+                                                 physicalEvent,
+                                                 positiveLatch,
+                                                 negativeLatch);
+            if (stateFieldValid)
+                supervisor = !physicalEvent;
+
+            // Once a state is established, another frame reporting that
+            // identical stable level is health/repeat traffic even if an old
+            // latch remains set. This covers the observed untouched Side
+            // Garage 5E 11... supervisor without weakening real transitions.
+            int trackerIndex = findCacheIndex(sensorID);
+            if (stateFieldValid && trackerIndex >= 0 &&
+                liveCache[trackerIndex].initialized &&
+                decodedState == liveCache[trackerIndex].lastKnownState)
             {
-                targetCell->sawSupervisor = true;
-                targetCell->sawPhysicalEvent = false;
-                logSupervisor(sensorID, statusByte);
+                physicalEvent = false;
+                supervisor = true;
             }
         }
 
-        targetCell->isOpen = calculatedOpen;
+#if RF_DEBUG
+        Serial.printf("[RF_RAW] %s ID=0x%06X BYTES=%02X %02X %02X %02X %02X COUNTER=%u STATUS=0x%02X CLASS=%s\n",
+                      cell->name, sensorID,
+                      local_byte_frame.data[0], local_byte_frame.data[1],
+                      local_byte_frame.data[2], local_byte_frame.data[3],
+                      local_byte_frame.data[4], currentCounter, statusByte,
+                      supervisor ? "SUPERVISOR" : "PHYSICAL");
+
+        if (stateFieldValid)
+        {
+            Serial.printf("[CONTACT_FIELDS] %s LEVEL=%u POS_LATCH=%u NEG_LATCH=%u\n",
+                          cell->name,
+                          decodedState ? 1 : 0,
+                          positiveLatch ? 1 : 0,
+                          negativeLatch ? 1 : 0);
+        }
+#endif
+
+        if (supervisor)
+        {
+            // Preserve the supervisor's stable debounced level separately
+            // for safe startup initialization. It must never alter or
+            // invalidate a physical event collected in the same session.
+            if (stateFieldValid)
+            {
+                if (!cell->supervisorStateValid)
+                {
+                    cell->supervisorStateValid = true;
+                    cell->supervisorState = decodedState;
+                    cell->supervisorConfirmCount = 1;
+                }
+                else if (cell->supervisorState == decodedState)
+                {
+                    if (cell->supervisorConfirmCount < 255)
+                        cell->supervisorConfirmCount++;
+                }
+                else
+                {
+                    // Contradictory supervisor copies cannot establish a
+                    // startup baseline.
+                    cell->supervisorStateValid = false;
+                    cell->supervisorConfirmCount = 0;
+                }
+            }
+
+            cell->sawSupervisor = true;
+            cell->supervisorStatus = statusByte;
+            cell->supervisorCounter = currentCounter;
+            continue;
+        }
+
+        // ---------------- PHYSICAL FRAME ----------------
+        if (isMotionSensor(sensorID))
+        {
+            // Motion is simply an event. There is no OPEN/CLOSED state.
+            if (!decodeMotionEvent(statusByte))
+                continue;
+
+            if (!cell->sawMotionEvent)
+            {
+                cell->sawMotionEvent = true;
+                cell->motionCounter = currentCounter;
+                cell->motionConfirmCount = 1;
+            }
+            else if (cell->motionCounter == currentCounter)
+            {
+                // Same counter = same physical transmission/event repeat.
+                if (cell->motionConfirmCount < 255)
+                    cell->motionConfirmCount++;
+            }
+            else
+            {
+                // A different counter is a new physical event.
+                // Do not mix counters inside one confirmation group.
+                cell->motionCounter = currentCounter;
+                cell->motionConfirmCount = 1;
+            }
+
+            continue;
+        }
+
+        if (!stateFieldValid)
+            continue;
+
+        if (!cell->sawPhysicalEvent)
+        {
+            cell->sawPhysicalEvent = true;
+            cell->physicalStateValid = true;
+            cell->physicalState = decodedState;
+            cell->physicalCounter = currentCounter;
+            cell->physicalConfirmCount = 1;
+        }
+        else if (cell->physicalCounter == currentCounter &&
+                 cell->physicalState == decodedState)
+        {
+            // Same counter + same state = another copy of the SAME event.
+            if (cell->physicalConfirmCount < 255)
+                cell->physicalConfirmCount++;
+        }
+        else
+        {
+            // A new counter is a new event. Garage OPEN and CLOSE can also
+            // share one counter, so a changed debounced level replaces the
+            // candidate instead of being discarded as a contradiction.
+            cell->physicalCounter = currentCounter;
+            cell->physicalState = decodedState;
+            cell->physicalStateValid = true;
+            cell->physicalConfirmCount = 1;
+        }
     }
 
     // ============================================================
-    // BLOCK 3 (PART 2): PIPELINE ENGINE & MEMORY STATE RESOLVER
+    // STEP 2: RESOLVE CONFIRMED PHYSICAL EVENTS
     // ============================================================
-    // --- STEP 2: STACK RESOLUTION PIPELINES ---
     unsigned long nowMs = millis();
-    for (int i = 0; i < SENSOR_COUNT; i++)
+
+    for (size_t i = 0; i < SENSOR_COUNT; i++)
     {
-        ScratchpadState *cell = sessionCache + i;
+        ScratchpadState *cell = &sessionCache[i];
         if (!cell->seen)
             continue;
 
         uint32_t sID = cell->id;
         const char *sName = cell->name;
-        bool currentOpen = cell->isOpen;
-        bool isMotion = (strstr(sName, "Motion") != nullptr);
+        bool motion = isMotionSensor(sID);
 
-        int cacheIdx = -1;
-        for (int c = 0; c < trackedSensorCount; c++)
+        int cacheIdx = findCacheIndex(sID);
+
+        // Create tracker if needed.
+        if (cacheIdx == -1 && trackedSensorCount < TRACKER_MAX)
         {
-            if (liveCache[c].id == sID)
-            {
-                cacheIdx = c;
-                break;
-            }
+            cacheIdx = trackedSensorCount;
+            LiveTracker *t = &liveCache[cacheIdx];
+
+            memset(t, 0, sizeof(LiveTracker));
+            t->id = sID;
+            t->lastPhysicalCounter = 0xFF;
+            t->physicalCounterValid = false;
+            t->lastMotionCounter = 0xFF;
+            t->motionCounterValid = false;
+            t->candidateConfirmCount = 0;
+            t->candidateStartTime = 0;
+
+            if (sID == id here || sID == id here)
+                t->confirmTimeout = 3000;
+            else
+                t->confirmTimeout = 2100;
+
+            trackedSensorCount++;
         }
 
-        if (cacheIdx == -1)
+        if (cacheIdx < 0)
+            continue;
+
+        LiveTracker *t = &liveCache[cacheIdx];
+
+        // --------------------------------------------------------
+        // Supervisors are health traffic. Their debounced level may safely
+        // establish the first RAM-only baseline after boot, but a supervisor
+        // can never overwrite an already initialized panel state.
+        // --------------------------------------------------------
+        if (cell->sawSupervisor)
         {
-            if (trackedSensorCount < TRACKER_MAX)
+            // If this session also contains a physical event, the
+            // supervisor is intentionally ignored for state purposes.
+            if (!cell->sawPhysicalEvent && !cell->sawMotionEvent)
             {
-                cacheIdx = trackedSensorCount;
-                liveCache[cacheIdx].id = sID;
-                liveCache[cacheIdx].blastSquelchTimer = 0;
-                liveCache[cacheIdx].lastSupervisorLogTime = 0;
-                liveCache[cacheIdx].pendingConfirmCount = 0;
-
-                if (sID == 0x1C274E || sID == id here) //garage tilt take a while to settle
+                // Keep the most recent supervisor counter as the motion
+                // baseline. Counter advancement alone is not motion.
+                if (motion)
                 {
-                    liveCache[cacheIdx].confirmTimeout = 6000;
-                }
-                else
-                {
-                    liveCache[cacheIdx].confirmTimeout = 2300;
+                    t->lastMotionCounter = cell->supervisorCounter;
+                    t->motionCounterValid = true;
                 }
 
-                if (cell->sawSupervisor && !cell->sawPhysicalEvent)
+                // With no NVS, an untouched sensor may first be seen through
+                // its periodic supervisor. Initialize from the stable level,
+                // but never generate SENSOR_EVENT for that baseline.
+                if (!motion && !t->initialized &&
+                    cell->supervisorStateValid &&
+                    cell->supervisorConfirmCount >= 2)
                 {
-                    liveCache[cacheIdx].initialized = false;
-                    logSupervisor(sID, cell->lastRawStatus);
-                    continue;
-                }
+                    t->lastKnownState = cell->supervisorState;
+                    t->initialized = true;
+                    t->lastEventTime = nowMs;
 
-                liveCache[cacheIdx].lastKnownState = currentOpen;
-                liveCache[cacheIdx].initialized = true;
-                liveCache[cacheIdx].lastEventTime = nowMs;
-                trackedSensorCount++;
-
-                if (!isMotion)
-                {
                     enqueueLog("SENSOR_INIT: %s (ID: 0x%06X) baseline state: %s",
-                               sName, sID, currentOpen ? "OPEN" : "CLOSED");
+                               sName, sID,
+                               t->lastKnownState ? "OPEN" : "CLOSED");
                 }
+
+                logSupervisor(sID, cell->supervisorStatus);
             }
-            continue;
         }
 
-        // Shield: intercept background check-ins and exit before state updates
-        if (cell->sawSupervisor && !cell->sawPhysicalEvent && liveCache[cacheIdx].initialized)
+        // --------------------------------------------------------
+        // MOTION PIPELINE
+        // --------------------------------------------------------
+        if (motion && cell->sawMotionEvent)
         {
-            logSupervisor(sID, cell->lastRawStatus);
-            continue;
-        }
-
-        // ============================================================
-        // PIPELINE EVALUATION ENGINE (PARALLEL PIPELINES)
-        // ============================================================
-
-        // --- Motion pipeline ---
-        if (isMotion)
-        {
-            if (cell->sawPhysicalEvent)
+            // Motion is an event only; it has no persistent OPEN/CLOSED state.
+            if (cell->motionConfirmCount >= 1)
             {
-                if (liveCache[cacheIdx].blastSquelchTimer > 0 && nowMs < liveCache[cacheIdx].blastSquelchTimer)
-                {
-                    // Squelched
-                }
-                else
-                {
-                    enqueueLog("%s", sName);
-                    neopixelWrite(INTERNAL_LED_PIN, 150, 75, 0);
+                bool counterChanged = !t->motionCounterValid ||
+                                      cell->motionCounter != t->lastMotionCounter;
 
-                    liveCache[cacheIdx].lastKnownState = false;
-                    liveCache[cacheIdx].lastEventTime = nowMs;
-                    liveCache[cacheIdx].blastSquelchTimer = nowMs + liveCache[cacheIdx].confirmTimeout;
+                // The frame has already passed the motion indication test.
+                // The counter now deduplicates repeats of that activation.
+                if (counterChanged)
+                {
+                    t->lastMotionCounter = cell->motionCounter;
+                    t->motionCounterValid = true;
+                    t->lastEventTime = nowMs;
 
-                    motionLedTimer = millis();
+                    enqueueLog("MOTION_EVENT: %s", sName);
+                    neopixelWrite(INTERNAL_LED_PIN, 150, 150, 0);
+                    motionLedTimer = nowMs;
                     motionLedActive = true;
                 }
             }
-
-            if (cell->sawSupervisor)
-            {
-                liveCache[cacheIdx].lastSupervisorLogTime = nowMs;
-            }
+            continue;
         }
 
-        // --- Contact/Tilt pipeline ---
-        if (!isMotion)
+        // --------------------------------------------------------
+        // CONTACT / GARAGE PIPELINE
+        // --------------------------------------------------------
+        if (!motion && cell->sawPhysicalEvent &&
+            cell->physicalStateValid && cell->physicalConfirmCount >= 1)
         {
-            if (cell->sawPhysicalEvent)
+            uint8_t eventCounter = cell->physicalCounter;
+            bool eventState = cell->physicalState;
+
+#if RF_DEBUG
+            Serial.printf("[CONTACT_DECODE] %s COUNTER=%u STATE=%s PREVIOUS=%s INITIALIZED=%d\n",
+                          sName, eventCounter,
+                          eventState ? "OPEN" : "CLOSED",
+                          t->lastKnownState ? "OPEN" : "CLOSED",
+                          t->initialized ? 1 : 0);
+#endif
+
+            bool newEvent = !t->physicalCounterValid ||
+                            eventCounter != t->lastPhysicalCounter;
+
+            if (!newEvent && eventState == t->lastKnownState)
             {
-                if (liveCache[cacheIdx].lastKnownState != currentOpen)
-                {
-                    if (liveCache[cacheIdx].blastSquelchTimer > 0 && nowMs < liveCache[cacheIdx].blastSquelchTimer)
-                    {
-                        // Squelched
-                    }
-                    else
-                    {
-                        if (liveCache[cacheIdx].pendingConfirmCount == 0)
-                        {
-                            liveCache[cacheIdx].confirmStartTime = nowMs;
-                        }
-                        liveCache[cacheIdx].pendingConfirmCount++;
-
-                        if (nowMs - liveCache[cacheIdx].confirmStartTime > liveCache[cacheIdx].confirmTimeout)
-                        {
-                            liveCache[cacheIdx].pendingConfirmCount = 1;
-                            liveCache[cacheIdx].confirmStartTime = nowMs;
-                        }
-
-                        if (liveCache[cacheIdx].pendingConfirmCount >= 2)
-                        {
-                            liveCache[cacheIdx].pendingConfirmCount = 0;
-
-                            if (!currentOpen)
-                            {
-                                neopixelWrite(INTERNAL_LED_PIN, 0, 150, 0);
-                            }
-                            else
-                            {
-                                neopixelWrite(INTERNAL_LED_PIN, 150, 0, 0);
-                            }
-                            doorLedTimer = millis();
-                            doorLedActive = true;
-
-                            liveCache[cacheIdx].lastKnownState = currentOpen;
-                            liveCache[cacheIdx].lastEventTime = nowMs;
-                            liveCache[cacheIdx].blastSquelchTimer = nowMs + liveCache[cacheIdx].confirmTimeout;
-
-                            enqueueLog("SENSOR_EVENT: %s turned: %s", sName, currentOpen ? "OPEN" : "CLOSED");
-                        }
-                    }
-                }
-                else
-                {
-                    if (nowMs - liveCache[cacheIdx].confirmStartTime > liveCache[cacheIdx].confirmTimeout)
-                    {
-                        liveCache[cacheIdx].pendingConfirmCount = 0;
-                    }
-                }
+                // Only the complete (counter,state) pair identifies a repeat.
+                continue;
             }
-            else if (cell->sawSupervisor)
+
+            // Do NOT require two separate RF sessions here. The sensor's
+            // repeated copies can be separated far enough that they land
+            // in different sessions, which previously caused a real CLOSE
+            // to remain stuck at the original OPEN baseline.
+
+            if (!t->initialized)
             {
-                if (liveCache[cacheIdx].lastSupervisorLogTime == 0 ||
-                    nowMs - liveCache[cacheIdx].lastSupervisorLogTime > 3600000)
-                {
-                    liveCache[cacheIdx].lastSupervisorLogTime = nowMs;
+                t->lastKnownState = eventState;
+                t->initialized = true;
+                t->lastPhysicalCounter = eventCounter;
+                t->physicalCounterValid = true;
+                t->lastEventTime = nowMs;
 
-                    bool batteryOK = (cell->lastRawStatus & 0x01) == 0;
-                    bool tamperOK = (cell->lastRawStatus & 0x02) == 0;
-
-                    enqueueLog("SUPERVISOR_HEALTH: %s (ID: 0x%06X) link status: OK | Battery: %s | Tamper: %s",
-                               sName, sID,
-                               batteryOK ? "OK" : "LOW",
-                               tamperOK ? "OK" : "TRIPPED");
-                }
+                enqueueLog("SENSOR_INIT: %s (ID: 0x%06X) baseline state: %s",
+                           sName, sID, eventState ? "OPEN" : "CLOSED");
+                continue;
             }
+
+            if (eventState == t->lastKnownState)
+            {
+                // The counter still advances even when the logical state is
+                // unchanged (for example, another physical sensor action).
+                t->lastPhysicalCounter = eventCounter;
+                t->physicalCounterValid = true;
+                t->lastEventTime = nowMs;
+                t->candidateConfirmCount = 0;
+                continue;
+            }
+
+            // An opposite state is a real event even when it shares the cycle
+            // counter with OPEN. Do not time-squelch contacts.
+            t->lastKnownState = eventState;
+            t->lastPhysicalCounter = eventCounter;
+            t->physicalCounterValid = true;
+            t->candidateConfirmCount = 0;
+            t->lastEventTime = nowMs;
+
+            if (!eventState)
+                neopixelWrite(INTERNAL_LED_PIN, 0, 150, 0);
+            else
+                neopixelWrite(INTERNAL_LED_PIN, 150, 0, 0);
+
+            doorLedTimer = nowMs;
+            doorLedActive = true;
+
+            enqueueLog("SENSOR_EVENT: %s turned: %s",
+                       sName, eventState ? "OPEN" : "CLOSED");
         }
     }
 
     noInterrupts();
     completedBurSTS = 0;
     interrupts();
+}
+
+// Utility: find cache index for a given sensor ID
+int findCacheIndex(uint32_t sensorID)
+{
+    for (int c = 0; c < trackedSensorCount; c++)
+    {
+        if (liveCache[c].id == sensorID)
+        {
+            return c;
+        }
+    }
+    return -1;
 }
 
 // ============================================================
@@ -814,11 +950,16 @@ void processLogQueue()
 
 void logSupervisor(uint32_t sensorID, uint8_t statusByte)
 {
+#if !LOG_SUPERVISORS
+    (void)sensorID;
+    (void)statusByte;
+    return;
+#else
     const char *sName = "Unknown Sensor";
     int cacheIdx = -1;
 
     // Find sensor name
-    for (int i = 0; i < SENSOR_COUNT; i++)
+    for (size_t i = 0; i < SENSOR_COUNT; i++)
     {
         if ((SENSOR_LIST + i)->id == sensorID)
         {
@@ -842,19 +983,19 @@ void logSupervisor(uint32_t sensorID, uint8_t statusByte)
     // Only log if we found the sensor in the struct and throttle allows
     if (cacheIdx >= 0)
     {
-        if (liveCache[cacheIdx].lastSupervisorLogTime == 0 || nowMs - liveCache[cacheIdx].lastSupervisorLogTime > 3600000) // 1 hour
+        if (liveCache[cacheIdx].lastSupervisorLogTime == 0 ||
+            nowMs - liveCache[cacheIdx].lastSupervisorLogTime >= SUPERVISOR_LOG_INTERVAL_MS)
         {
             liveCache[cacheIdx].lastSupervisorLogTime = nowMs;
 
-            bool batteryOK = (statusByte & 0x01) == 0;
-            bool tamperOK = (statusByte & 0x02) == 0;
-
-            enqueueLog("SUPERVISOR_HEALTH: %s (ID: 0x%06X) link status: OK | Battery: %s | Tamper: %s",
+            // Status bits 2:0 are the three-bit trigger counter, so they must
+            // not be reported as battery/tamper flags.
+            enqueueLog("SUPERVISOR_HEALTH: %s (ID: 0x%06X) link status: OK | Counter: 0x%X | Status: 0x%02X",
                        sName, sensorID,
-                       batteryOK ? "OK" : "LOW",
-                       tamperOK ? "OK" : "TRIPPED");
+                       decodeEventCounter(statusByte), statusByte);
         }
     }
+#endif
 }
 
 void checkLedTimeout()
@@ -935,7 +1076,7 @@ void setup()
     initCC1101();
     // Permit metadata
     const char *alarmPermitInfo =
-        "City of _____ Alarm Permit #____ (Valid start date to end date)";
+        "City of _____ Alarm Permit #___ (Valid ____ to ____)";
     if (WiFi.status() == WL_CONNECTED)
     {
         Serial.println("[TEST] Launching official localized protocol boot packet...");
